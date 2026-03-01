@@ -127,8 +127,8 @@ async fn login_via_flaresolverr(
         return Err(format!("Failed to login via FlareSolverr: {}", solution.status).into());
     }
 
-    // GET root page to finalize session
-    flaresolverr
+    // GET root page to finalize session and capture all cookies
+    let root_response = flaresolverr
         .get(&format!("https://{}/", domain), session_ref, None)
         .await?;
 
@@ -138,9 +138,53 @@ async fn login_via_flaresolverr(
         stop.duration_since(start)
     );
 
+    // Create a direct HTTP client with cookies and User-Agent from FlareSolverr session.
+    // This is needed because FlareSolverr (Chrome) cannot handle:
+    // - JSON API responses (wraps them in HTML)
+    // - Binary file downloads (.torrent files)
+    // The cf_clearance cookie is tied to the User-Agent, so we MUST use the exact
+    // same User-Agent string from FlareSolverr's Chrome instance.
+    let solution = root_response.solution.as_ref();
+    let user_agent = solution
+        .map(|s| s.user_agent.clone())
+        .unwrap_or_else(|| "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36".to_string());
+
+    debug!("cookie_client User-Agent: {}", user_agent);
+
+    let mut default_headers = HeaderMap::new();
+    default_headers.insert(
+        wreq::header::USER_AGENT,
+        user_agent.parse().unwrap_or_else(|_| "Mozilla/5.0".parse().unwrap()),
+    );
+
+    let cookie_client = Client::builder()
+        .default_headers(default_headers)
+        .cookie_store(true)
+        .cert_verification(false)
+        .verify_hostname(false)
+        .build()?;
+
+    if let Some(solution) = solution {
+        let url = Url::parse(&format!("https://{}/", domain))?;
+        for c in &solution.cookies {
+            let cookie = wreq::cookie::CookieBuilder::new(&c.name, &c.value)
+                .domain(&c.domain)
+                .path(&c.path)
+                .http_only(true)
+                .secure(true)
+                .build();
+            cookie_client.set_cookie(&url, cookie);
+        }
+        debug!(
+            "Created cookie_client with {} cookies from FlareSolverr (UA: Chrome)",
+            solution.cookies.len()
+        );
+    }
+
     Ok(YggClient::Proxied {
         flaresolverr: Arc::new(flaresolverr),
         session_id: session_id.unwrap_or_default(),
+        cookie_client,
     })
 }
 

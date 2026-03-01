@@ -27,6 +27,12 @@ pub async fn download_torrent(
 
     let response = data.client.post_form(&url, &body).await?;
 
+    debug!("start_download_timer response: status={}, body_len={}, body_preview='{}'",
+        response.status,
+        response.body.len(),
+        &response.body[..response.body.len().min(200)]
+    );
+
     if !(200..300).contains(&response.status) {
         return Err(format!("Failed to get token: {}", response.status).into());
     }
