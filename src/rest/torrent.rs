@@ -1,6 +1,7 @@
 use crate::DOMAIN;
 use crate::config::Config;
 use crate::rest::client_extractor::MaybeCustomClient;
+use crate::ygg_client::YggClient;
 use actix_web::{HttpRequest, HttpResponse, get, web};
 use serde_json::Value;
 use tokio::time::{Duration, sleep};
@@ -27,19 +28,40 @@ pub async fn download_torrent(
 
     let mut response = data.client.post_form(&url, &body).await?;
 
-    // If 403, session expired - re-authenticate using cookie_client and retry
-    if response.status == 403 {
-        warn!("Download token returned 403, re-authenticating...");
-        let login_url = format!("https://{}{}", domain, crate::LOGIN_PROCESS_PAGE);
-        let login_body = format!("id={}&pass={}", config.username, config.password);
-        let login_resp = data.client.post_form(&login_url, &login_body).await?;
+    // Track which client to use for subsequent requests.
+    // If re-auth happens, we switch to the fresh client.
+    let active_client: &YggClient;
+    let new_client_holder: Option<YggClient>;
 
-        if (200..400).contains(&login_resp.status) {
-            info!("Re-authenticated, retrying download token...");
-            response = data.client.post_form(&url, &body).await?;
-        } else {
-            return Err(format!("Re-authentication failed: {}", login_resp.status).into());
+    // If 403, cf_clearance expired - full re-auth via FlareSolverr
+    if response.status == 403 {
+        warn!("Download token returned 403 (cf_clearance likely expired), performing full re-authentication via FlareSolverr");
+
+        // Best-effort: destroy the old FlareSolverr session
+        if let YggClient::Proxied { flaresolverr, session_id, .. } = &data.client {
+            if !session_id.is_empty() {
+                let _ = flaresolverr.destroy_session(session_id).await;
+                debug!("Destroyed old FlareSolverr session: {}", session_id);
+            }
         }
+
+        // Full re-authentication (FlareSolverr flow: GET login page + POST login + GET root)
+        let fresh_client = crate::auth::login(
+            config.username.as_str(),
+            config.password.as_str(),
+            true,
+            config.flaresolverr_url.as_deref(),
+        )
+        .await?;
+
+        info!("Re-authenticated via FlareSolverr, retrying download token...");
+        response = fresh_client.post_form(&url, &body).await?;
+
+        new_client_holder = Some(fresh_client);
+        active_client = new_client_holder.as_ref().unwrap();
+    } else {
+        new_client_holder = None;
+        active_client = &data.client;
     }
 
     debug!("start_download_timer response: status={}, body_len={}, body_preview='{}'",
@@ -73,11 +95,11 @@ pub async fn download_torrent(
     );
     debug!("download URL {}", url);
 
-    let (status, bytes) = data.client.get_bytes(&url).await?;
+    let (status, bytes) = active_client.get_bytes(&url).await?;
 
     if !(200..300).contains(&status) {
         if status == 302 {
-            return match crate::utils::get_remaining_downloads(&data.client).await {
+            return match crate::utils::get_remaining_downloads(active_client).await {
                 Ok(0) => {
                     error!("No remaining downloads");
                     Err("No remaining downloads".into())
