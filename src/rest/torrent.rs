@@ -25,7 +25,22 @@ pub async fn download_torrent(
 
     debug!("Request download token {} {}", url, body);
 
-    let response = data.client.post_form(&url, &body).await?;
+    let mut response = data.client.post_form(&url, &body).await?;
+
+    // If 403, session expired - re-authenticate using cookie_client and retry
+    if response.status == 403 {
+        warn!("Download token returned 403, re-authenticating...");
+        let login_url = format!("https://{}{}", domain, crate::LOGIN_PROCESS_PAGE);
+        let login_body = format!("id={}&pass={}", config.username, config.password);
+        let login_resp = data.client.post_form(&login_url, &login_body).await?;
+
+        if (200..400).contains(&login_resp.status) {
+            info!("Re-authenticated, retrying download token...");
+            response = data.client.post_form(&url, &body).await?;
+        } else {
+            return Err(format!("Re-authentication failed: {}", login_resp.status).into());
+        }
+    }
 
     debug!("start_download_timer response: status={}, body_len={}, body_preview='{}'",
         response.status,
